@@ -1,0 +1,1250 @@
+---
+title: "SickKidsSucrose"
+geometry: margin=2cm
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+fontsize: 12pt
+urlcolor: blue
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(tidyverse)
+library(ggpubr)
+library(psych)
+library(lme4)
+library(emmeans)
+library(broom)
+library(broom.mixed)
+library(corrplot)
+library(VennDiagram)
+library(rstatix)
+library(gridExtra)
+library(ggeasy)
+library(patchwork)
+library(ggeffects)
+library(MuMIn) # R^2 of LMEM
+library(directlabels)
+```
+
+# Overview
+
+This study was performed in Toronto in Steven Miller's lab. Preterm infants were scanned shortly after birth, and later at term equivalent age (TEA). Resting state fMRI scans were acquired with ~100 time-points.
+
+Johann processed all scans:
+
+* bias field correction
+* registration to preterm and term templates
+* brain segmentation (e.g. grey matter masks)
+* fMRI motion correction
+* fMRI nuisance regression
+* Power Spectral Density (PSD) analysis using Welch's Method to determine Hurst exponent (H)
+* registration to 40wk template and group ICA analysis to determine shared resting state networks (RSN)
+
+Data analysis was completed by the end of August 2021. It then came to our attention that the clinical data from SickKids may be incomplete, at which point we stopped performing the statistical analysis.
+
+We received updated clinical data in December 2021. Johann went through and reviewed the changes. As far as we can tell no significant changes were made. We will, however, be using the updated data.
+
+# Hypotheses
+
+Our main hypotheses are:
+
+* H is a sensitive measure of brain development: with greater postmenstrual age (PMA) we will see greater H in fMRI signal, suggesting more efficient, organized, and higher-order processing.
+* H will also be sensitive to disruptions in brain development, such as GA: at TEA, infants born younger will have lower H values
+
+# Initial Look at Our Data
+
+Let's collect and organize our data.
+
+```{r, echo = FALSE}
+loaddata = read.csv("sucrose_master_data_FWHM_5_final_networkremoved.csv")
+#fulldata = loaddata[,1:31]
+numofcol = 7
+head(loaddata[,1:numofcol])
+```
+
+## Merge data
+
+```{r}
+networkdata <- read.csv("mean_welch_in_networks_FWHM_5.csv")
+newdata <- full_join(loaddata,networkdata, by = c('Subject.ID','AGE'))
+loaddata <- newdata
+```
+
+
+## Brain age and Scan age from Initial Cohort
+
+```{r}
+fulldata.age <- loaddata[c(1:4)]
+fulldata.age %>% distinct(Subject.ID, .keep_all = TRUE) %>% summarize(Median = median(Birth.age, na.rm=TRUE), Range = range(Birth.age, na.rm=TRUE))
+fulldata.age %>% filter(AGE == "v01") %>% summarise(Median = median(Scan.Age), Range = range(Scan.Age), n = n())
+fulldata.age %>% filter(AGE == "v02") %>% summarise(Median = median(Scan.Age), Range = range(Scan.Age), n = n())
+```
+## rename
+
+```{r}
+loaddata <- loaddata %>% rename(gm_m = gm.cort.mean, wm_m = wm.mean, vent_m = vent.mean)
+```
+
+```{r}
+fulldata <- loaddata %>% select(!c(gm.cort.mean.no.overlap, csf.std, wm.std, wm.std.no.overlap, csf.mean, cereb.std, gm.deep.std, gm.cort.mean.no.overlap, gm.cort.std.no.overlap, wm.mean.no.overlap, wm.std.no.overlap, visual_std, motor_std, lateral_r_std, cerebellum_std, frontal_std, lateral_l_std, hindbrain_std, posterior_std, cerebellum_std, auditory_std, temporal_lobe_std, gm.cort.std, vent.std, gm.deep.mean, cereb.mean))
+
+```
+
+## More 
+
+[note: `r ncol(fulldata) - numofcol` columns and `r nrow(fulldata) - 6` rows not shown]
+
+There are `r nrow(fulldata)` rows (scans) with `r length(unique(fulldata$Subject.ID))` unique subjects. This means not all subjects had both their Preterm and TEA scans acquired. Sometimes only the preterm or the TEA scan was acquired.
+
+We have `r ncol(fulldata)` columns of data:
+
+1. Subject ID: unique identification number (factor)
+2. Cohort: PMA when scanned; either preterm or TEA (two factors)
+3. Gestational Age (weeks): age when the infant was born (continuous)
+4. Postmenstrual Age (PMA) at Scan (weeks): age when the infant was scanned (continuous)
+5. mean Framewise Displacement (mm): amount of motion when scanned (continuous)
+6. Sex (1 = Male, 0 = Female [?]), 
+
+# Subjects After MRI Quality Check
+
+Subjects were removed if:
+
+* their anatomical data was deemed too poor to analyze (dHCP fails)
+* fMRI volumes < 100
+* mean FD > 1 mm
+
+```{r, echo=FALSE, warning= FALSE,message=FALSE}
+fullruns <- fulldata %>% drop_na()
+fullruns$AGE <- as.factor(fullruns$AGE)
+fullruns$sex <- as.factor(fullruns$sex)
+fullrun.stats <- describeBy(fullruns)
+fullrun.stats_byAGE <- describeBy(fullruns ~ AGE)
+v01uniquebyage <- fullruns[fullruns$AGE=="v01",] %>% summarise(count = n_distinct(Subject.ID)) %>% as.numeric()
+v02uniquebyage <- fullruns[fullruns$AGE=="v02",] %>% summarise(count = n_distinct(Subject.ID)) %>% as.numeric()
+fullruns.pairs <- fullruns %>% group_by(Subject.ID) %>% filter(n()>1)
+fullruns.nopairs <- fullruns %>% anti_join(fullruns.pairs)
+```
+
+After data quality exclusion, we are left with `r nrow(fullruns)` scans, and `r length(unique(fullruns$Subject.ID))` unique subjects; meaning we retained `r round(length(unique(fullruns$Subject.ID))/length(unique(fulldata$Subject.ID)) * 100,2)`% of subjects. 
+
+Of the `r length(unique(fullruns$Subject.ID))` unique subjects:
+
+* `r v01uniquebyage - sum(duplicated(fullruns$Subject.ID), na.rm = TRUE)` have only preterm scans (of `r v01uniquebyage` total preterm scans)
+* `r v02uniquebyage - sum(duplicated(fullruns$Subject.ID), na.rm = TRUE)` with only TEA scans (of `r v02uniquebyage` total TEA scans)
+* `r sum(duplicated(fullruns$Subject.ID), na.rm = TRUE)` with both preterm and TEA scans.
+
+```{r}
+fullrun.stats_byAGE
+```
+
+
+```{r, echo=FALSE, results='hide'}
+grid.newpage()
+draw.pairwise.venn(area1=v01uniquebyage, area2=v02uniquebyage, cross.area = (sum(duplicated(fullruns$Subject.ID), na.rm = TRUE)), category=c("TEA", "Preterm"),fill=c("Green", "orange"))
+```
+
+# Demographics
+
+```{r}
+fullruns %>% distinct(Subject.ID, .keep_all = TRUE) %>% filter(sex == 1) %>% summarise(Males = n(), na.rm=TRUE)
+fullruns %>% filter(AGE == "v01") %>% filter(sex == 1) %>% summarise(Males = n(), na.rm=TRUE)
+fullruns %>% filter(AGE == "v02") %>% filter(sex == 1) %>% summarise(Males = n(), na.rm=TRUE)
+```
+
+# Data Visualization
+
+Let's visualize some of our variables
+
+## Outcome Variables
+
+### H in GM
+
+Let's start with our primary outcome variable: H
+
+Let's look in the greymatter (GM) for now...
+
+```{r, echo=FALSE, message=F, warning=F}
+ggplot(fullruns, aes(x=gm_m)) + geom_histogram( color="white", fill="purple") +
+  geom_vline(aes(xintercept=mean(gm_m)), color="black", linetype="dashed", size=1) +
+  annotate("text", x=mean(fullruns$gm_m), y=18, label= paste("mean =",round(mean(fullruns$gm_m),2), sep=" ")) +
+  labs(x = "H in Grey Matter", y = "Counts") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+It looks like we *might* have an outlier in H in GM.
+
+```{r,echo=FALSE}
+out.H_GM <- boxplot.stats(fullruns$gm_m)$out
+out_ind.H_GM <- which(fullruns$gm_m %in% c(out.H_GM))
+knitr::kable(fullruns[out_ind.H_GM,c(1:5)], col.names = c("Subject ID", "Cohort", "GA", "PMA at Scan", "mean FD"))
+```
+
+Let's keep `r fullruns[out_ind.H_GM,c(1)]` at `r fullruns[out_ind.H_GM,c(2)]` in mind for later...
+
+What about by PMA?
+
+```{r, echo=FALSE, message=F, warning=F}
+ggplot(fullruns, aes(x=gm_m)) + 
+  geom_histogram( aes(color = AGE, fill = AGE), position = "identity", alpha = 0.25) +
+  labs(x = "H in GM", y = "Counts") +
+  scale_fill_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + scale_color_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + labs(x = "H in Grey Matter", y = "Counts") +
+  geom_vline(xintercept = c(fullrun.stats_byAGE$v01[20,3], fullrun.stats_byAGE$v02[20,3]), linetype = "dashed") +
+  annotate("text", x=c(0.62,0.92), y=12, label=c(paste("mean =",round(fullrun.stats_byAGE$v01[20,3],2)),paste("mean =",round(fullrun.stats_byAGE$v02[20,3],2)) ), sep=" ") +
+  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+What about our predictor variables?
+
+## Predictor Variables
+
+
+### FD
+
+Let's look at mean Framewise Displacement. We will likely have to control for meanFD when looking at H.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(fullruns, aes(x=FD)) +
+  geom_histogram(aes(color = AGE, fill = AGE), position = "identity", alpha = 0.25)+
+  scale_fill_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + scale_color_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + labs(x = "Mean Framewise Displacement (mm)", y = "Counts") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+Is framewise displacement different between Preterm and TEA cohorts?
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(fullruns, aes(x = AGE, y=FD, fill=AGE)) + geom_boxplot(aes(fill=AGE)) +
+  scale_x_discrete(labels=c("v01" = "Preterm", "v02" = "TEA")) +
+  scale_fill_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + 
+  scale_color_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) +
+  labs(y = "Mean Framewise Displacement (mm)") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+Since the two age groups have a mix of paired and unpaired subjects, we will have to do a linear mixed effects model to compare them.
+
+Although, if we do a paired t.test on just the pairs:
+
+```{r, echo=FALSE}
+
+fullruns.pairs_t.test <- t.test(Pair(FD, AGE)~1, data = fullruns.pairs)
+fullruns.pairs_t.test
+```
+
+We end up with a p-value of `r fullruns.pairs_t.test$p.value` and difference of mean 95% CI of `r fullruns.pairs_t.test$conf.int`. But we'll come back to this.
+
+In unpaired subjects:
+
+```{r, echo=FALSE}
+(fullruns.nopairs_t.test <- t.test(Pair(FD, AGE) ~ 1, data = fullruns.nopairs))
+```
+
+### Gestational Age
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(fullruns, aes(x=Birth.age)) + geom_histogram(color="white", fill="purple") +
+  geom_vline(aes(xintercept=mean(Birth.age)), color="black", linetype="dashed", size=1) +
+  annotate("text", x=mean(fullruns$Birth.age), y=10, label= paste("median =",round(median(fullruns$Birth.age),2), sep=" ")) +
+  labs(x = "Gestational Age (weeks)", y = "Counts") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+### PMA at Scan
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggplot(fullruns, aes(x=Scan.Age)) +
+  geom_histogram(aes(color = AGE, fill = AGE), position = "identity", alpha = 0.25)+
+  scale_fill_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + scale_color_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + labs(x = "Postmenstrual Age at Scan (weeks)", y = "Counts") +
+  geom_vline(xintercept = c(fullrun.stats_byAGE$v01[4,3], fullrun.stats_byAGE$v02[4,3]+1), linetype = "dashed") +
+  annotate("text", x=c(30,40), y=12, label=c(paste("median =",round(fullrun.stats_byAGE$v01[4,5],2)),paste("median =",round(fullrun.stats_byAGE$v02[4,5],2)) ), sep=" ")+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+# Basic linear models
+
+Let's do simple linear regressions of our hypotheses.
+
+## H in GM vs. PMA
+
+```{r, echo=FALSE, message=F, warning=F}
+basic.lm_pma <- lm(gm_m ~ Scan.Age, data = fullruns)
+summary(basic.lm_pma)
+```
+
+H in GM and PMA definitely seem correlated.
+
+### Plot
+```{r, echo=F,message=F,warning=F}
+(prelim_plot_pma <- ggplot(fullruns, aes(x = Scan.Age, y = gm_m)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  stat_cor(aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~")),label.x = 30, label.y = 1.1) +
+  ylab("Hurst in Grey Matter") + xlab("Post Menstrual Age (weeks)")) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+```
+
+## H in GM vs FD
+
+But maybe there are covariates we need to worry about. FD for example:
+
+```{r, echo=FALSE, message=F, warning=F}
+basic.lm_fd <- lm(gm_m ~ FD, data = fullruns)
+summary(basic.lm_fd)
+```
+
+H in GM and FD seem correlated.
+
+### Plot
+```{r, echo=F,message=F,warning=F}
+(prelim_plot_fd <- ggplot(fullruns, aes(x = FD, y = gm_m)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  stat_cor(aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~")),label.x = 0.25, label.y = 1.1) +
+  ylab("Hurst in Grey Matter") + xlab("Mean Framewise Displacement (mm)"))+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+```
+
+When looking at H, we will definitely want to control for meanFD.
+
+## FD vs PMA
+
+Is mean FD correlated with PMA at Scan?
+
+```{r, echo=FALSE}
+basic.lm_fdage <- lm(FD ~ Scan.Age, data = fullruns)
+summary(basic.lm_fdage)
+```
+
+### Plot
+```{r,echo=F,message=F,warning=F}
+(prelim_plot_fdage <- ggplot(fullruns, aes(x = Scan.Age, y = FD)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+   stat_cor(aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~")),label.x = 30, label.y = 1.1) +
+  ylab("Mean Framewise Displacement (mm)") + xlab("Post Menstrual Age at Scan Date (weeks)"))+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+It looks like it is weakly correlated, if at all. But again, this might be something we will want to take into account in our models.
+
+Essentially older babies move less, and moving less leads to higher H.
+
+## H in GM vs Sex
+
+Is there a difference in H in GM with sex?
+
+```{r, echo=F,message=F,warning=F}
+ggplot(fullruns, aes(x = sex, y = gm_m, fill = sex)) +
+  geom_boxplot(fill = c("pink", "blue")) +
+  ylab("H in Grey Matter") + xlab("Sex") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+```
+
+We can perform a t-test with just our TEA cohort:
+
+```{r, echo=F}
+t.test(gm_m ~ sex, data = fullruns[fullruns$AGE=="v02",])
+```
+
+It looks like sex doesn't make a difference...
+
+## H in GM vs. GA at TEA
+
+Our second hypothesis has to do with H and how old the baby was when they were born.
+
+For example, at TEA, do babies born earlier have lower H values?
+
+```{r, echo=F}
+basic.lm_ga <- lm(gm_m ~ Birth.age, data = fullruns[fullruns$AGE=="v02",])
+summary(basic.lm_ga)
+```
+### Plot
+
+```{r, echo=F,message=F,warning=F}
+(prelim_plot_sucrose <- ggplot(fullruns[fullruns$AGE=="v02",], aes(x = Birth.age, y = gm_m)) +
+  geom_point() +
+  geom_smooth(method = "lm")+
+   stat_cor(aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~")),label.x = 28, label.y = 1) +
+  ylab("H in GM") + xlab("Gestational Age (weeks)")) + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+It doesn't look like it.
+
+If there is a correlation there, it is subtle or being masked by other factors...
+
+## Basic Stats
+
+```{r}
+fullruns 
+```
+
+
+# Linear Mixed Effects Model
+
+Let's try a more sophisticated method that will properly take into account paired and unpaired subjects in order to maximize our power. 
+We will use mixed linear effects models and have subjects as random variables.
+This will also take into account other fixed effects, interactions, etc. etc.
+
+
+## Missing Data
+
+One issue, however, is with our missing values: is there a non-random reason why some babies weren't scanned again at TEA?
+
+Let's look at two specific cohorts: babies scanned at preterm age with TEA scans later on, and those scanned at preterm age without follow-up scans (either due to MRI data quality or they didn't get scanned)
+
+```{r, echo=F,message=F,warning=F}
+fullrunsv01_noTEA <- fullruns.pairs[fullruns.pairs$AGE=="v01",]
+fullrunsv01_noTEA$group <- "noTEA"
+fullrunsv01_wTEA <- fullruns.nopairs[fullruns.nopairs$AGE=="v01",]
+fullrunsv01_wTEA$group <- "wTEA"
+fullrunsv01_combined <- dplyr::bind_rows(fullrunsv01_noTEA,fullrunsv01_wTEA)
+fullrunsv01_combined$group <- as.factor(fullrunsv01_combined$group)
+fullrunsv01_combined <- fullrunsv01_combined[,c(3:5,24)]
+```
+
+```{r, echo=F,message=F,warning=F}
+fullrunsv01_combined_long <- fullrunsv01_combined %>% pivot_longer(-group, names_to = "variables", values_to = "value")
+```
+
+```{r, echo=F,message=F,warning=F}
+stat.test <- fullrunsv01_combined_long %>% group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "holm") %>%
+  add_significance()
+```
+
+
+```{r, echo=F,message=F,warning=F}
+group.names <- c("Gestational Age (weeks)", "Mean FD (mm)", "Post Menstrual Age (weeks)")
+names(group.names) <- c("Birth.age","FD","Scan.Age")
+myplot <- ggboxplot(
+  fullrunsv01_combined_long, x = "group", y = "value",
+  fill = "group", palette = "npg", legend = "none",
+  ggtheme = theme_pubr(border = TRUE)
+  ) +
+  facet_wrap(~variables, scales="free_y", labeller = as_labeller(group.names))
+# Add statistical test p-values
+stat.test <- stat.test %>% add_xy_position(x = "group")
+stat.test$y.position <- stat.test$y.position -3.6
+stat.test$y.position[2] <- stat.test$y.position[2] - .7
+myplot + stat_pvalue_manual(stat.test, label = "p.adj.signif") + xlab("") + ylab("")
+```
+
+```{r}
+png(file="SupFig1_GAFDPMA.png", width=7, height=4, units="in", res=300)
+myplot + stat_pvalue_manual(stat.test, label = "p.adj.signif") + xlab("") + ylab("")
+dev.off()
+
+```
+
+
+It looks like the one thing that distinguishes this group is those without followup data were, on average, born at a younger GA.
+
+We should include GA in our models.
+
+## H in GM vs PMA
+
+Let's test our first hypothesis.
+
+Focusing first on the GM, let's build our model:
+
+HinGM ~ PMA + FD + GA + (1|Subject.ID)
+
+Essentially how is H in GM related to PMA. Because we worry about FD, we will include it in our model. Gestational age is included as we worry that our missing values are due to GA (very preterm subjects may be too sick to come back for the TEA scan). Finally, we are treating subjects as random effects: each subject will have random vanriance w.r.t. their H value. This will also take into account repeat measures.
+
+```{r,echo=F,message=F,warning=F}
+mixed.lmer_contA <- lmer(gm_m ~ Scan.Age + FD + Birth.age + (1|Subject.ID), REML=FALSE, data = fullruns)
+summary(mixed.lmer_contA)
+```
+This looks like a lot, but essentially it is saying H = `r round(as.numeric(tidy(mixed.lmer_contA)[1,4]),3)` + `r round(as.numeric(tidy(mixed.lmer_contA)[2,4]),3)`xPMA `r round(as.numeric(tidy(mixed.lmer_contA)[3,4]),3)`xFD + `r round(as.numeric(tidy(mixed.lmer_contA)[4,4]),3)`xGA
+
+Let's try GA=25, PMA=40, FD=0.5:
+
+H = `r round(as.numeric(tidy(mixed.lmer_contA)[1,4]),3)` + `r round(as.numeric(tidy(mixed.lmer_contA)[2,4]),3)`x40 `r round(as.numeric(tidy(mixed.lmer_contA)[3,4]),3)`x0.5 + `r round(as.numeric(tidy(mixed.lmer_contA)[4,4]),3)`x25
+
+H = `r round( (as.numeric(tidy(mixed.lmer_contA)[1,4]) + as.numeric(tidy(mixed.lmer_contA)[2,4])*40 + as.numeric(tidy(mixed.lmer_contA)[3,4])*0.5 + as.numeric(tidy(mixed.lmer_contA)[4,4])*25), 3)`
+
+Which agrees well with what we saw before.
+
+Let's test our main hypothesis then: is H affected by PMA?
+
+```{r, echo=F, message=F, warning=F}
+knitr::kable(anova(mixed.lmer_contA, lmer(gm_m ~ Birth.age + FD + (1|Subject.ID), REML=FALSE, data = fullruns)), row.names = F, digits=c(1,1,1,1,1,1,1,32))
+```
+
+Yes, very much so.
+
+FD?
+
+```{r, echo=F, message=F, warning=F}
+knitr::kable(anova(mixed.lmer_contA, lmer(gm_m ~ Scan.Age + Birth.age + (1|Subject.ID), REML=FALSE, data = fullruns)), row.names = F, digits=c(1,1,1,1,1,1,1,32)) 
+```
+
+Yes.
+
+And GA?
+
+```{r, echo=F, message=F, warning=F}
+knitr::kable(anova(mixed.lmer_contA, lmer(gm_m ~ Scan.Age + FD + (1|Subject.ID), REML=FALSE, data = fullruns)), row.names = F, digits=c(1,1,1,1,1,1,1,32)) 
+```
+
+Not so much. But we should keep it in as we worry about missing values.
+
+
+## GM and WM
+
+```{r, echo=F,message=F,warning=F}
+roidata <- fullruns[,c(-23)] %>% pivot_longer(ends_with('_m'), names_to = 'ROI', values_to = 'H')
+roidata$ROI <- as.factor(roidata$ROI)
+matterdata <- roidata %>% filter(ROI == "gm_m" | ROI == "wm_m" | ROI == "vent_m")
+matter.model <- lmer(H ~ Scan.Age*ROI + Birth.age + FD + (1+ROI|Subject.ID), REML=FALSE, data = matterdata)
+summary(matter.model)
+```
+
+```{r, echo=F,message=F,warning=F}
+matternames <- c("gm_m" = "GM", "wm_m" = "WM", "vent_m" = "Ventricles")
+H_matterpredict <- ggpredict(matter.model, terms = c("Scan.Age","ROI"), ci.lvl=0.95)
+
+```
+
+```{r}
+ventPredict <- H_matterpredict %>% filter(group == "vent_m")
+ventData <- roidata %>% filter(ROI == "vent_m")
+ventplot <- ggplot() + geom_point(data=ventData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=ventData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=ventPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="magenta1",alpha=0.15,)+
+  geom_line(data=ventPredict, aes(x=x, y = conf.high), colour = "magenta1", linetype = "dashed") +
+  geom_line(data=ventPredict, aes(x=x, y = conf.low), colour = "magenta1", linetype = "dashed") +
+  geom_line(data=ventPredict, aes(x,predicted), color="magenta1") +
+  labs(x='', y='') +
+  ggtitle("Ventricles") +
+  theme(plot.title = element_text(size=10))+
+  ggeasy::easy_center_title() +
+  ylim(0.5,1) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+ventplot
+```
+
+
+```{r}
+WMPredict <- H_matterpredict %>% filter(group == "wm_m")
+WMData <- roidata %>% filter(ROI == "wm_m")
+wmplot <- ggplot() + geom_point(data=WMData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=WMData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=WMPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#cab2d6",alpha=0.15,)+
+  geom_line(data=WMPredict, aes(x=x, y = conf.high), colour = "#cab2d6", linetype = "dashed") +
+  geom_line(data=WMPredict, aes(x=x, y = conf.low), colour = "#cab2d6", linetype = "dashed") +
+  geom_line(data=WMPredict, aes(x,predicted), color="#cab2d6") +
+  labs(x='', y='') +
+  ggtitle("White Matter") +
+  theme(plot.title = element_text(size=10))+
+  ggeasy::easy_center_title() +
+  ylim(0.5,1) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+GMPredict <- H_matterpredict %>% filter(group == "gm_m")
+GMData <- roidata %>% filter(ROI == "gm_m")
+gmplot <- ggplot() + geom_point(data=GMData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=GMData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=GMPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#6a3d9a",alpha=0.15,)+
+  geom_line(data=GMPredict, aes(x=x, y = conf.high), colour = "#6a3d9a", linetype = "dashed") +
+  geom_line(data=GMPredict, aes(x=x, y = conf.low), colour = "#6a3d9a", linetype = "dashed") +
+  geom_line(data=GMPredict, aes(x,predicted), color="#6a3d9a") +
+  labs(x='', y='') +
+  ggtitle("Grey Matter") +
+  theme(plot.title = element_text(size=10))+
+  ggeasy::easy_center_title() +
+  ylim(0.5,1) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r, echo=F,message=F,warning=F}
+matter.colors <- c(gm_m = "#6a3d9a", wm_m= "#cab2d6", vent_m = "magenta1")
+matterplot <- ggplot(H_matterpredict, aes(x=x, y=predicted, color=group)) +
+  geom_smooth(method="lm", se=F)+ geom_line(aes(x=x, y=conf.high), linetype="dashed", alpha=0.3)+ geom_line(aes(x=x, y=conf.low), linetype="dashed", alpha=0.3) +
+  scale_color_manual(values=matter.colors, limits=c("gm_m","wm_m","vent_m"), labels = c("GM", "WM", "Ventricles")) +
+    labs(x='PMA at Scan (weeks)', y='Predicted H by ROI') + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+matterplot
+```
+
+
+```{r}
+patchworkmatter = gmplot + wmplot + ventplot + matterplot + #guide_area() + 
+  plot_layout(ncol = 2, guides= 'collect')
+patchworkmatter[[2]] = patchworkmatter[[2]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank())
+
+patchworkmatter + plot_annotation(tag_levels = 'A')
+```
+```{r}
+png(file="Figure4_tissueplots_annotated.png", width=7, height=4, units="in", res=300)
+patchworkmatter + plot_annotation(tag_levels = 'A')
+dev.off()
+```
+
+
+```{r}
+gmmodel <- roidata %>% filter(ROI == "gm_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(gmmodel)
+r.squaredGLMM(gmmodel)
+```
+```{r}
+wmmodel <- roidata %>% filter(ROI == "wm_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(wmmodel)
+r.squaredGLMM(wmmodel)
+```
+
+### Estimated marginal means
+
+```{r, echo=F,message=F,warning=F}
+tissue.model <- fullruns %>% select(c(Subject.ID, Scan.Age, Birth.age, FD, gm_m, wm_m, vent_m)) %>% pivot_longer(ends_with('_m'), names_to = 'ROI', values_to = 'H') %>% with(lmer(H ~ Scan.Age*ROI + Birth.age + FD + (1+ROI|Subject.ID), REML=FALSE))
+
+```
+
+```{r, echo=F,message=F,warning=F}
+  tissueemmeans_ScanAge33and41 <- tissue.model %>% emmeans(~Scan.Age*ROI, at=list(Scan.Age=c(32.7,40.9)))
+```
+```{r, echo=F,message=F,warning=F}
+tissueemmeans_ScanAge33and41
+```
+```{r, echo=F,message=F,warning=F}
+#emmeans_ScanAge33and41.df <- as.data.frame(emmeans_ScanAge33and41)
+```
+
+
+```{r}
+tissueslopes <- emtrends(tissue.model, ~ ROI, var="Scan.Age")
+tidytissueslopes <- tidy(tissueslopes, conf.int = T) %>% dplyr::select(ROI, Scan.Age.trend, p.value, conf.low, conf.high)
+```
+
+
+```{r}
+tissueslopes %>% contrast("revpairwise") %>% tidy(.)
+```
+```{r}
+fullruns %>% filter(AGE == "v01") %>% with(t.test(gm_m, wm_m, paired=TRUE, alternative = "two.sided"))
+```
+```{r}
+fullruns %>% select(c(Subject.ID, AGE, gm_m, wm_m)) %>% pivot_longer(ends_with('_m'), names_to = 'ROI', values_to = 'H') %>% filter(AGE == "v01") %>% cohens_d(H ~ ROI, paired = TRUE)
+```
+
+
+```{r}
+fullruns %>% filter(AGE == "v02") %>% with(t.test(gm_m, wm_m, paired=TRUE, alternative = "two.sided"))
+```
+```{r}
+fullruns %>% select(c(Subject.ID, AGE, gm_m, wm_m)) %>% pivot_longer(ends_with('_m'), names_to = 'ROI', values_to = 'H') %>% filter(AGE == "v02") %>% cohens_d(H ~ ROI, paired = TRUE)
+```
+
+
+## H vs PMA across ROIs
+
+What about across our ROIs?
+
+```{r,echo=F,message=F,warning=F}
+
+roinames <- c(`frontal_m` = "Frontal", `hindbrain_m` = "Hindbrain", `lateral_l_m` = "Lateral Left", `lateral_r_m` = "Lateral Right", `motor_m` = "Motor", `posterior_m` = "Posterior", `cerebellum_m` = "Cerebellum", `visual_m`="Visual", `salient_m` = "Salient", `auditory_m` = "Auditory")
+```
+
+![ROIs](ROIs.png)
+
+Now our model will look like:
+
+H ~ PMA*ROI + FD + GA + (1+ROI|Subject.ID)
+
+Essentially we think that each ROI might have a different H vs PMA response, both in terms of the intercept, and its slope.
+
+```{r}
+rsndata <- roidata %>% filter(ROI != "gm_m" & ROI != "wm_m" & ROI != "vent_m" & ROI != "temporal_lobe_m" & ROI != "posterior_m")
+```
+
+
+```{r, echo=F, message=F}
+
+rsn.model.contA <- lmer(H ~ Scan.Age*ROI + Birth.age + FD + (1+ROI|Subject.ID), REML=FALSE, data = rsndata)
+summary(rsn.model.contA)
+```
+
+Is H statistically significant across PMA in some of these ROIs?
+
+```{r, echo=F, message=F}
+anova.rsn.model <- anova(rsn.model.contA, lmer(H ~ ROI + FD + Birth.age + (1+ROI|Subject.ID), REML=FALSE, data = rsndata))
+```
+```{r, echo=F, message=F}      
+knitr::kable(anova.rsn.model, row.names = F, digits=c(1,1,1,1,1,1,1,1000)) 
+
+```
+
+Yes, they are.
+
+But which ones? And how much (slope)?
+
+```{r, echo=F,message=F,warning=F}
+Hpredict <- ggpredict(rsn.model.contA, terms = c("Scan.Age","ROI"), ci.lvl=0.95)
+```
+
+```{r}
+VisualPredict <- Hpredict %>% filter(group == "visual_m")
+VisualData <- roidata %>% filter(ROI == "visual_m")
+visplot <- ggplot() + geom_point(data=VisualData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=VisualData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=VisualPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#a6cee3",alpha=0.15,)+
+  geom_line(data=VisualPredict, aes(x=x, y = conf.high), colour = "#a6cee3", linetype = "dashed") +
+  geom_line(data=VisualPredict, aes(x=x, y = conf.low), colour = "#a6cee3", linetype = "dashed") +
+  geom_line(data=VisualPredict, aes(x,predicted), color="#a6cee3") +
+  labs(x='', y='') +
+  ggtitle("Visual") +
+  theme(plot.title = element_text(size=10))+
+  ggeasy::easy_center_title() +
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+MotorPredict <- Hpredict %>% filter(group == "motor_m")
+MotorData <- roidata %>% filter(ROI == "motor_m")
+motorplot <- ggplot() + geom_point(data=MotorData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=MotorData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=MotorPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#1f78b4",alpha=0.15,)+
+  geom_line(data=MotorPredict, aes(x=x, y = conf.high), colour = "#1f78b4", linetype = "dashed") +
+  geom_line(data=MotorPredict, aes(x=x, y = conf.low), colour = "#1f78b4", linetype = "dashed") +
+  geom_line(data=MotorPredict, aes(x,predicted), color="#1f78b4") +
+  labs(x='', y='') +
+    ggtitle("Motor") +
+  ggeasy::easy_center_title() +
+  theme(plot.title = element_text(size=10))+
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+LateralRPredict <- Hpredict %>% filter(group == "lateral_r_m")
+LateralRData <- roidata %>% filter(ROI == "lateral_r_m")
+latrplot <- ggplot() + geom_point(data=LateralRData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=LateralRData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=LateralRPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#b2df8a",alpha=0.15,)+
+  geom_line(data=LateralRPredict, aes(x=x, y = conf.high), colour = "#b2df8a", linetype = "dashed") +
+  geom_line(data=LateralRPredict, aes(x=x, y = conf.low), colour = "#b2df8a", linetype = "dashed") +
+  geom_line(data=LateralRPredict, aes(x,predicted), color="#b2df8a") +
+  labs(x='', y='') +
+    ggtitle("Lateral Right") +
+  ggeasy::easy_center_title() +
+    theme(plot.title = element_text(size=10))+
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+AuditoryPredict <- Hpredict %>% filter(group == "auditory_m")
+AuditoryData <- roidata %>% filter(ROI == "auditory_m")
+auditoryplot <- ggplot() + geom_point(data=AuditoryData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=AuditoryData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=AuditoryPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#33a02c",alpha=0.15,)+
+  geom_line(data=AuditoryPredict, aes(x=x, y = conf.high), colour = "#33a02c", linetype = "dashed") +
+  geom_line(data=AuditoryPredict, aes(x=x, y = conf.low), colour = "#33a02c", linetype = "dashed") +
+  geom_line(data=AuditoryPredict, aes(x,predicted), color="#33a02c") +
+  labs(x='', y='') +
+    ggtitle("Auditory") +
+  ggeasy::easy_center_title() +
+    theme(plot.title = element_text(size=10))+
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+LateralLPredict <- Hpredict %>% filter(group == "lateral_l_m")
+LateralLData <- roidata %>% filter(ROI == "lateral_l_m")
+latlplot <- ggplot() + geom_point(data=LateralLData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=LateralLData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=LateralLPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#fb9a99",alpha=0.15,)+
+  geom_line(data=LateralLPredict, aes(x=x, y = conf.high), colour = "#fb9a99", linetype = "dashed") +
+  geom_line(data=LateralLPredict, aes(x=x, y = conf.low), colour = "#fb9a99", linetype = "dashed") +
+  geom_line(data=LateralLPredict, aes(x,predicted), color="#fb9a99") +
+  labs(x='', y='') +
+    ggtitle("Lateral Left") +
+  theme(plot.title = element_text(size=10))+
+  ggeasy::easy_center_title() +
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+CerebellumPredict <- Hpredict %>% filter(group == "cerebellum_m")
+CerebellumData <- roidata %>% filter(ROI == "cerebellum_m")
+cerebellumplot <- ggplot() + geom_point(data=CerebellumData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=CerebellumData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=CerebellumPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#e31a1c",alpha=0.15,)+
+  geom_line(data=CerebellumPredict, aes(x=x, y = conf.high), colour = "#e31a1c", linetype = "dashed") +
+  geom_line(data=CerebellumPredict, aes(x=x, y = conf.low), colour = "#e31a1c", linetype = "dashed") +
+  geom_line(data=CerebellumPredict, aes(x,predicted), color="#e31a1c") +
+  labs(x='', y='') +
+    ggtitle("Cerebellum") +
+  ggeasy::easy_center_title() +
+    theme(plot.title = element_text(size=10))+
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+FrontalPredict <- Hpredict %>% filter(group == "frontal_m")
+FrontalData <- roidata %>% filter(ROI == "frontal_m")
+frontplot <- ggplot() + geom_point(data=FrontalData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=FrontalData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=FrontalPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#fdbf6f",alpha=0.15,)+
+  geom_line(data=FrontalPredict, aes(x=x, y = conf.high), colour = "#fdbf6f", linetype = "dashed") +
+  geom_line(data=FrontalPredict, aes(x=x, y = conf.low), colour = "#fdbf6f", linetype = "dashed") +
+  geom_line(data=FrontalPredict, aes(x,predicted), color="#fdbf6f") +
+  labs(x='', y='') +
+    ggtitle("Frontal") +
+    theme(plot.title = element_text(size=10))+
+  ggeasy::easy_center_title() +
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+HindbrainPredict <- Hpredict %>% filter(group == "hindbrain_m")
+HindbrainData <- roidata %>% filter(ROI == "hindbrain_m")
+hindplot <- ggplot() + geom_point(data=HindbrainData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=HindbrainData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=HindbrainPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#ff7f00",alpha=0.15,)+
+  geom_line(data=HindbrainPredict, aes(x=x, y = conf.high), colour = "#ff7f00", linetype = "dashed") +
+  geom_line(data=HindbrainPredict, aes(x=x, y = conf.low), colour = "#ff7f00", linetype = "dashed") +
+  geom_line(data=HindbrainPredict, aes(x,predicted), color="#ff7f00") +
+  labs(x='', y='') +
+    ggtitle("Hindbrain") +
+  ggeasy::easy_center_title() +
+    theme(plot.title = element_text(size=10))+
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r}
+SalientPredict <- Hpredict %>% filter(group == "salient_m")
+SalientData <- roidata %>% filter(ROI == "salient_m")
+salientplot <- ggplot() + geom_point(data=SalientData, aes(Scan.Age, H), shape=1) +
+  geom_smooth(data=SalientData, aes(Scan.Age, H), method="lm", colour="grey", size=0.5, alpha=0.3) +
+  geom_ribbon(data=SalientPredict, aes(x=x,ymin=conf.low, ymax=conf.high), fill="#ffff00",alpha=0.15,)+
+  geom_line(data=SalientPredict, aes(x=x, y = conf.high), colour = "#ffff00", linetype = "dashed") +
+  geom_line(data=SalientPredict, aes(x=x, y = conf.low), colour = "#ffff00", linetype = "dashed") +
+  geom_line(data=SalientPredict, aes(x,predicted), color="#ffff00") +
+  labs(x='', y='') +
+    ggtitle("Salient") +
+  ggeasy::easy_center_title() +
+    theme(plot.title = element_text(size=10))+
+  ylim(0.5,1.3) +
+  theme(legend.position = "none") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+
+```{r}
+patchworkrsn = visplot + motorplot + latrplot + latlplot + cerebellumplot + frontplot + auditoryplot + hindplot + salientplot
+patchworkrsn[[1]] = patchworkrsn[[1]] + theme(axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[2]] = patchworkrsn[[2]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[3]] = patchworkrsn[[3]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[3]] = patchworkrsn[[3]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[4]] = patchworkrsn[[4]] + theme(axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[5]] = patchworkrsn[[5]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[6]] = patchworkrsn[[6]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.text.x = element_blank(),
+                                        axis.ticks.x = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[7]] = patchworkrsn[[7]] + theme(axis.title.x = element_blank())
+patchworkrsn[[8]] = patchworkrsn[[8]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn[[9]] = patchworkrsn[[9]] + theme(axis.text.y = element_blank(),
+                                        axis.ticks.y = element_blank(),
+                                        axis.title.y = element_blank(),
+                                        axis.title.x = element_blank())
+patchworkrsn
+```
+
+```{r}
+png(file="Figure6_roiplots.png", width=7, height=4, units="in", res=300)
+patchworkrsn
+dev.off()
+```
+
+
+Or another look:
+
+```{r, echo=F,message=F,warning=F}
+rsnnames2 <- c("Visual", "Motor",  "Lateral Right", "Auditory", "Lateral L", "Cerebellum", "Frontal", "Hindbrain", "Salient")
+rsnnames3 <- c("visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m", "salient_m")
+rsn.colors <- c(frontal_m = "#fdbf6f", hindbrain_m = "#ff7f00", lateral_l_m = "#fb9a99", lateral_r_m = "#b2df8a", motor_m = "#1f78b4", auditory_m = "#33a02c", cerebellum_m = "#e31a1c", visual_m = "#a6cee3", salient_m = "#ffff00")
+Hpredictrsn <- Hpredict #%>% filter(group != "gm_m" & group != "wm_m" & group != "vent_m")
+Hpredictrsn$group <- factor(Hpredictrsn$group, levels=c("visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m", "salient_m"))
+rsnslopes <- ggplot(Hpredictrsn, aes(x=x, y=predicted, color=group)) +
+  geom_smooth(method="lm", se=F)+ 
+  scale_color_manual(values=rsn.colors,limits = rsnnames3, labels = rsnnames2, name="RSN") +
+    labs(x='PMA at Scan (weeks)', y='Predicted H by ROI') + 
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"), legend.position = c(.15, .75))
+```
+
+```{r}
+rsnslopes2 <- ggplot(Hpredictrsn, aes(x=x, y=predicted, color=group)) +
+  geom_smooth(method="lm", se=F)+ 
+  scale_color_manual(values=rsn.colors,limits = rsnnames3, labels = rsnnames2, name="RSN") +
+  geom_dl(aes(label = group), method = "last.points", cex = 0.8) +
+    labs(x='PMA at Scan (weeks)', y='Predicted H by ROI')  + 
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"), legend.position = "none", plot.margin = unit(c(1,3,1,1), "lines")) +
+  coord_cartesian(clip = 'off')
+```
+
+```{r}
+rsnslopes2
+```
+
+
+```{r}
+grid.draw(ggplotGrob(rsnslopes2))
+
+```
+
+
+In descending order of slope:
+
+```{r, echo=F,message=F,warning=F}
+#all_combo <- emmeans(roi.model.contA, ~ Scan.Age*ROI)
+
+ROIslopes <- emtrends(rsn.model.contA, ~ ROI, var="Scan.Age")
+tidyslopes <- tidy(ROIslopes, conf.int = T) %>% dplyr::select(ROI, Scan.Age.trend, p.value, conf.low, conf.high)
+```
+
+
+```{r, echo=F, message=F, warning=F}
+tidyslopes$p.adj <- p.adjust(tidyslopes$p.value, method = "holm")
+tidyslopes <- tidyslopes %>% arrange(desc(Scan.Age.trend)) %>% dplyr::select(ROI, Scan.Age.trend, p.adj, conf.low, conf.high) %>% dplyr::rename("Slope" = Scan.Age.trend)
+```
+
+```{r, echo=F,message=F,warning=F}
+knitr::kable(tidyslopes, row.names = F, digits=c(0,4,32,4,4)) 
+```
+
+```{r, echo=F,message=F,warning=F}
+tidyslopes.table <- tidyslopes[c(1,2)]
+tidyslopes.table$Slope <- round(tidyslopes.table$Slope,4)
+colnames(tidyslopes.table) = c("RSN", "Slope")
+tidyslopes.table <- tidyslopes.table %>% filter(RSN != "gm_m" & RSN != "wm_m" & RSN != "vent_m")
+tidyslopes.table[tidyslopes.table == "visual_m"] <- "Visual"
+tidyslopes.table[tidyslopes.table == "motor_m"] <- "Motor"
+tidyslopes.table[tidyslopes.table == "lateral_r_m"] <- "Lateral Right"
+tidyslopes.table[tidyslopes.table == "auditory_m"] <- "Auditory"
+tidyslopes.table[tidyslopes.table == "lateral_l_m"] <- "Lateral Left"
+tidyslopes.table[tidyslopes.table == "cerebellum_m"] <- "Cerebellum"
+tidyslopes.table[tidyslopes.table == "frontal_m"] <- "Frontal"
+tidyslopes.table[tidyslopes.table == "salient_m"] <- "Salient"
+tidyslopes.table[tidyslopes.table == "hindbrain_m"] <- "Hindbrain"
+#tidyslopes.table
+rsnslopes + gridExtra::tableGrob(tidyslopes.table[, c('RSN', 'Slope')], row = NULL, theme=ttheme_minimal()) + plot_layout(widths = c(2.5, 1))
+```
+
+```{r}
+png(file="Figure7_roislopescomparison.png", width=7, height=4, units="in", res=300)
+rsnslopes + gridExtra::tableGrob(tidyslopes.table[, c('RSN', 'Slope')], row = NULL, theme=ttheme_minimal()) + plot_layout(widths = c(2.5, 1))
+dev.off()
+```
+
+
+```{r}
+rsnslopes
+```
+
+
+```{r, echo=F,message=F,warning=F}
+tidyROIslopes <- ROIslopes %>% contrast("revpairwise") %>% tidy(.)
+```
+
+```{r, echo=F,message=F,warning=F}
+tidyROIslopes <- tidyROIslopes %>% dplyr::select(contrast, adj.p.value)
+tidyROIslopes$adj.p.value <- round(tidyROIslopes$adj.p.value, 4)
+tidyROIslopes
+```
+
+
+```{r, echo=F,message=F,warning=F}
+fullruns %>% filter(AGE == "v01") %>% {t.test(.$wm_m, .$gm_m, paired=TRUE, alternative = "two.sided")}
+fullruns[c(1,2,9,10)] %>% filter(AGE == "v01") %>% pivot_longer(cols = ends_with("_m"), names_to = "ROI", values_to = "H") %>% cohens_d(H ~ ROI, paired=TRUE)
+fullruns %>% filter(AGE == "v02") %>% {t.test(.$wm_m, .$gm_m, paired=TRUE, alternative = "two.sided")}
+fullruns[c(1,2,9,10)] %>% filter(AGE == "v02") %>% pivot_longer(cols = ends_with("_m"), names_to = "ROI", values_to = "H") %>% cohens_d(H ~ ROI, paired=TRUE)
+```
+
+```{r, echo=F,message=F,warning=F}
+fullruns %>% filter(AGE == "v01") %>% {t.test(.$vent_m, .$gm_m, paired=TRUE, alternative = "two.sided")}
+fullruns[c(1,2,9,11)] %>% filter(AGE == "v01") %>% pivot_longer(cols = ends_with("_m"), names_to = "ROI", values_to = "H") %>% cohens_d(H ~ ROI, paired=TRUE)
+fullruns %>% filter(AGE == "v02") %>% {t.test(.$vent_m, .$gm_m, paired=TRUE, alternative = "two.sided")}
+fullruns[c(1,2,9,11)] %>% filter(AGE == "v02") %>% pivot_longer(cols = ends_with("_m"), names_to = "ROI", values_to = "H") %>% cohens_d(H ~ ROI, paired=TRUE)
+```
+
+In terms of RSNs (ignoring GM and WM), the greatest change in H with PMA is: 
+
+If we look at percent change based on adjusted values for preterm (~32 weeks) and TEA (~42 weeks), the order changes slightly:
+
+```{r, echo=F}
+pred.roi.model.cont <- ggpredict(rsn.model.contA, terms=c("ROI","Scan.Age")) %>% filter(!(x=='gm_m' | x=='wm_m'))
+pred.preterm <- pred.roi.model.cont %>% filter(group == 32.38) %>% pull(2)
+pred.TEA <- pred.roi.model.cont %>% filter(group == 41.85) %>% pull(2)
+#((pred.TEA / pred.preterm)-1)*100
+pred.change <- data.frame(pred.roi.model.cont %>% filter(group == 41.85) %>% pull(1), (((pred.TEA-0.5) / (pred.preterm-0.5)))*100)
+names(pred.change)[1] <- "ROI"
+names(pred.change)[2] <- "Percent Change (32 to 42 weeks)"
+pred.change %>% arrange(across(starts_with("Percent"),desc))
+```
+
+The most brain development appears to be occuring in the Auditory and Cerebellum networks, with the least happening in the Frontal.
+This makes intuitive sense: after they are born, suddenly they are seeing and moving more, and those networks appear to develop rapidly with all this new information.
+
+### R^2
+
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m"
+vismodel <- roidata %>% filter(ROI == "visual_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(vismodel)
+r.squaredGLMM(vismodel)
+```
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m"
+motormodel <- roidata %>% filter(ROI == "motor_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(motormodel)
+r.squaredGLMM(motormodel)
+```
+
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m"
+lateral_r_model <- roidata %>% filter(ROI == "lateral_r_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(lateral_r_model)
+r.squaredGLMM(lateral_r_model)
+```
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m"
+auditorymodel <- roidata %>% filter(ROI == "auditory_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(auditorymodel)
+r.squaredGLMM(auditorymodel)
+```
+
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m"
+lateral_l_model <- roidata %>% filter(ROI == "lateral_l_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(lateral_l_model)
+r.squaredGLMM(lateral_l_model)
+```
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m"
+cerebellummodel <- roidata %>% filter(ROI == "cerebellum_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(cerebellummodel)
+r.squaredGLMM(cerebellummodel)
+```
+
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m"
+frontalmodel <- roidata %>% filter(ROI == "frontal_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(frontalmodel)
+r.squaredGLMM(frontalmodel)
+```
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m"
+salientmodel <- roidata %>% filter(ROI == "salient_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(salientmodel)
+r.squaredGLMM(salientmodel)
+```
+
+```{r}
+# "visual_m", "motor_m",  "lateral_r_m", "auditory_m", "lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m"
+hindbrainmodel <- roidata %>% filter(ROI == "hindbrain_m") %>% lmer(H ~ Scan.Age + Birth.age + FD + (1|Subject.ID), REML=FALSE, data=.)
+summary(hindbrainmodel)
+r.squaredGLMM(hindbrainmodel)
+```
+
+### Estimated Marginal Means
+
+```{r, echo=F,message=F,warning=F}
+emmeans_ScanAge33and41 <- rsn.model.contA %>% emmeans(~Scan.Age*ROI, at=list(Scan.Age=c(32.7,40.9)))
+```
+```{r, echo=F,message=F,warning=F}
+emmeans_ScanAge33and41
+```
+```{r}
+emmeans_ScanAge33and41.df <- as.data.frame(emmeans_ScanAge33and41)
+emmeans_ScanAge33and41.df %>% filter(Scan.Age == "32.7") %>% summarise(mean = mean(emmean), range = range(emmean))
+
+```
+```{r}
+emmeans_ScanAge33and41.df %>% filter(Scan.Age == "40.9") %>% summarise(mean = mean(emmean), range = range(emmean))
+
+```
+
+```{r, echo=F,message=F,warning=F}
+emmeans_ScanAge33and41.df <- as.data.frame(emmeans_ScanAge33and41)
+```
+
+```{r, echo=F,message=F,warning=F}
+contrast(emmeans_ScanAge33and41, "revpairwise", by="ROI", adjust="Holm")
+```
+
+```{r, echo=F,message=F,warning=F}
+contrast(emmeans_ScanAge33and41, "pairwise", by="Scan.Age", adjust="Holm")
+```
+
+
+```{r, echo=F,message=F,warning=F}
+emmeanplot <- emmeans_ScanAge33and41.df %>% mutate(ROI = fct_relevel(ROI,"motor_m","visual_m","lateral_r_m","auditory_m","lateral_l_m", "cerebellum_m", "frontal_m", "hindbrain_m", "salient_m")) %>%
+ggplot(aes(x=ROI, y=emmean, fill=as.factor(Scan.Age))) + geom_col(position=position_dodge()) +
+  geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=.2, position=position_dodge(.9)) +
+  coord_cartesian(ylim = c(0.5, .9)) + ylab("Estimated Marginal Mean of H") +
+  scale_fill_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + scale_color_manual(values=c("green", "orange"), name = "Cohort", labels = c("Preterm", "TEA")) + 
+  xlab("RSN") +
+  scale_x_discrete(limit = c("visual_m","motor_m","lateral_r_m","auditory_m","lateral_l_m", "hindbrain_m", "salient_m", "cerebellum_m", "frontal_m"),
+                     labels = c("Visual","Motor","Lateral Right","Auditory","Lateral Left", "Hindbrain", "Salient", "Cerebellum", "Frontal")) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1),panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r, echo=F,message=F,warning=F}
+diffplot <- emmeans_ScanAge33and41.df %>% select(c(Scan.Age, emmean, ROI)) %>% mutate(Scan.Age = replace(Scan.Age, Scan.Age==32.7, "Age32.7"))%>% mutate(Scan.Age = replace(Scan.Age, Scan.Age==40.9, "Age40.9")) %>% pivot_wider(names_from = Scan.Age, values_from = emmean) %>% mutate(difference = Age40.9-Age32.7) %>%
+  ggplot(aes(x=ROI, y=difference)) + geom_col(position=position_dodge(), fill="blue") +
+  ylab("Difference of Estimated Marginal Means of H") +
+  xlab("RSN") +
+  scale_x_discrete(limit = c("visual_m","motor_m","lateral_r_m","auditory_m","lateral_l_m", "hindbrain_m", "salient_m", "cerebellum_m", "frontal_m"),
+                     labels = c("Visual","Motor","Lateral Right","Auditory","Lateral Left", "Hindbrain", "Cerebellum", "Salient", "Frontal" )) +
+  scale_y_continuous(expand = c(0,0)) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1),panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+```{r, echo=F,message=F,warning=F}
+emmeanplot + diffplot #+ plot_layout(heights = 3, widths=1, ncol=2)
+```
+
+
+```{r}
+png(file="Figure5_differencebarblots.png", width=7, height=4, units="in", res=300)
+emmeanplot + diffplot #+ plot_layout(heights = 3, widths=1, ncol=2)
+dev.off()
+```
+
+
+
+## H in GM vs GA
+
+Let's test our second hypothesis: H in GM will be affected by the baby's GA. Let's look at just the TEA (n = `r v02uniquebyage`).
+
+First we will set up our full model [note: this is a simple multiple linear regression now]:
+
+HinGM ~ GA + PMA + FD
+
+```{r,  echo=F,message=F,warning=F}
+TEAonly <- fullruns[fullruns$AGE=="v02",] %>% as.data.frame(row.names = 1:nrow(.))
+lm_GA <- lm(gm_m ~ Birth.age + Scan.Age + FD, REML=FALSE, data=TEAonly)
+summary(lm_GA)
+```
+
+And now let's test against our null model:
+
+HinGM ~ PMA + FD
+
+```{r, echo=F,message=F,warning=F}
+knitr::kable(anova(lm_GA, lm(gm_m ~ Scan.Age + FD, REML=FALSE, data=TEAonly)), row.names = F, digits=c(1,1,1,1,1,3))
+```
+
+It doesn't look like it. Let's visualize this:
+
+
+```{r, echo=F,message=F,warning=F}
+HGM_GApredict <- ggpredict(lm_GA, "Birth.age", ci.lvl=0.95)
+ggplot() +
+  geom_point(data = TEAonly, aes(x = Birth.age, y = gm_m)) +
+  geom_smooth(data = TEAonly, aes(x = Birth.age, y=gm_m), color="blue", se=F, method="lm") +
+  geom_line(data = HGM_GApredict, aes(x = x, y = predicted), method="lm", se=F, color="red") +
+  geom_ribbon(data = HGM_GApredict, aes(x= x, y = predicted, ymin = conf.low, ymax = conf.high), alpha = .1) + 
+  ylab("Hurst in GM") + xlab("GA (weeks)")
+```
+
+We can't see the two different slopes as they appear to be identical: including PMA and FD hasn't affected the correlation between HinGM and GA.
+
+### What about any ROIs?
+
+H ~ Birth.age*ROI + Scan.Age + FD + (1|ROI)
+
+```{r, echo=FALSE}
+TEA.roidata <- TEAonly %>% pivot_longer(ends_with('_m'), names_to = 'ROI', values_to = 'H')
+roi.model.GA <- lmer(H ~ Birth.age*ROI + Scan.Age + FD + (1|ROI), REML=FALSE, data = TEA.roidata)
+summary(roi.model.GA)
+```
+
+Which we will test against the null model:
+
+H ~ ROI + Scan.Age*IVH + FD + (1|ROI)
+
+```{r, echo=F, warning=F, message=F}
+knitr::kable(anova(roi.model.GA,lmer(H ~ ROI + Scan.Age + FD + (1|ROI), REML=FALSE, data = TEA.roidata)), row.names = F, digits=c(1,1,1,1,1,1,1,4)) 
+
+```
+
+No, it doesn't look like it.
+
+## GA vs PMA: colinear?
+
+```{r}
+ggplot(data=TEAonly, aes(x = Birth.age, y = Scan.Age)) + geom_point()
+```
